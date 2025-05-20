@@ -1,0 +1,23 @@
+{
+  "name": "aws-devops-mcp-server",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "build/index.js",
+  "scripts": {
+    "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', 0o755)\" && node -e \"require('fs').chmodSync('build/http-wrapper.js', 0o755)\"",
+    "start": "node build/index.js",
+    "start:http": "node build/http-wrapper.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ec2": "^3.808.0",
+    "@modelcontextprotocol/sdk": "^1.11.2",
+    "express": "^4.19.2",
+    "body-parser": "^1.20.2"
+  },
+  "devDependencies": {
+    "@types/body-parser": "^1.19.5",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.15.17",
+    "typescript": "^5.8.3"
+  }
+}

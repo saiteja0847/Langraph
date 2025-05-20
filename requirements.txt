@@ -1,0 +1,5 @@
+langgraph
+boto3
+python-dotenv
+openai>=1.0.0
+pytest
