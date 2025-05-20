@@ -1,4 +1,8 @@
 from agent import _agent_runnable # Import the compiled agent
+import boto3
+import os
+
+ec2_client = boto3.client('ec2', region_name=os.getenv('AWS_DEFAULT_REGION', 'us-east-1'))
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage # Import SystemMessage
 from typing import List
 
@@ -59,6 +63,21 @@ def main():
                 agent_reply_content = str(last_message.content or "Agent processed the request.")
         
         print(f"Agent: {agent_reply_content}")
+
+def run_ec2_instance():
+    try:
+        response = ec2_client.run_instances()
+        instance_ids = [inst.get('InstanceId') for inst in response.get('Instances', [])]
+        ids_str = ", ".join(instance_ids)
+        return f"EC2 instance launched successfully. Instance IDs: {ids_str}"
+    except Exception as e:
+        return f"Error launching EC2 instance: {str(e)}"
+
+def parse_intent(text: str) -> str:
+    lower = text.lower()
+    if 'ec2' in lower and any(word in lower for word in ('run', 'launch')):
+        return 'run_ec2_instance'
+    return 'unknown'
 
 if __name__ == "__main__":
     main()

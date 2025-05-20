@@ -11,7 +11,8 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMe
 from langchain_core.tools import Tool, StructuredTool # Import StructuredTool
 from langchain_core.utils.function_calling import convert_to_openai_function
 from openai import OpenAI, APIError
-from pydantic import BaseModel, Field # Import Pydantic components
+from pydantic import BaseModel, Field, create_model # Import Pydantic components and create_model
+import time
 
 # Load environment variables
 load_dotenv()
@@ -25,96 +26,99 @@ OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8000") # Define your MCP server's base URL
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Define Pydantic model for the MCP tool arguments
-# This mirrors the JSON schema defined in the MCP server's index.ts
-class CreateEc2InstanceArgs(BaseModel):
-    image_id: str = Field(..., description="The ID of the AMI (Amazon Machine Image) to use for the instance. Required.")
-    min_count: int = Field(..., description="The minimum number of instances to launch. Usually 1. Required.")
-    max_count: int = Field(..., description="The maximum number of instances to launch. Usually 1. Required.")
-    instance_type: str = Field(default="t2.micro", description="The type of instance to launch, e.g., \"t2.micro\", \"m5.large\".")
-    key_name: Optional[str] = Field(default=None, description="The name of the key pair for SSH access.")
-    security_group_ids: Optional[List[str]] = Field(default=None, description="A list of security group IDs.")
-    subnet_id: Optional[str] = Field(default=None, description="The ID of the subnet to launch the instance into.")
-    user_data: Optional[str] = Field(default=None, description="User data to make available to the instance.")
-    ebs_optimized: Optional[bool] = Field(default=False, description="Whether the instance is optimized for Amazon EBS I/O.")
-    monitoring_enabled: Optional[bool] = Field(default=False, description="Enables detailed monitoring for the instance.")
-    availability_zone: Optional[str] = Field(default=None, description="The Availability Zone to launch the instance into, e.g., \"us-east-1a\".")
-    tags: Optional[Dict[str, str]] = Field(default=None, description="A dictionary of key-value pairs to assign as tags. For instance name, use key \"Name\". Example: {\"Name\": \"MyServer\", \"Environment\": \"Dev\"}")
-    disable_api_termination: Optional[bool] = Field(default=False, description="If true, enables instance termination protection.")
-    instance_initiated_shutdown_behavior: Optional[str] = Field(default="stop", description="Whether the instance should \"stop\" or \"terminate\" when shut down from within the OS.")
-    block_device_mappings: Optional[List[Dict[str, Any]]] = Field(default=None, description="Define EBS volumes. List of mappings, e.g., [{\"DeviceName\": \"/dev/sda1\", \"Ebs\": {\"VolumeSize\": 30, \"VolumeType\": \"gp3\"}}]")
-    iam_instance_profile: Optional[Dict[str, str]] = Field(default=None, description="IAM instance profile. Provide as {\"Arn\": \"arn:aws:iam::ACCOUNT:instance-profile/PROFILE_NAME\"} or {\"Name\": \"PROFILE_NAME\"}.")
 
 # Create a LangChain Tool instance for the MCP tool.
 # This function will now call the MCP server.
 def execute_tool_via_mcp(tool_name: str, **kwargs) -> str:
     """
-    Calls the MCP server to execute a specified tool with given arguments.
+    Calls the MCP server to execute a specified tool with given arguments, with retries and timing.
     """
     endpoint = f"{MCP_SERVER_URL}/execute_tool/{tool_name}"
     logger.info(f"Calling MCP server endpoint: {endpoint} with args: {kwargs}")
+    max_retries = 3
+    backoff = 1
+    for attempt in range(1, max_retries + 1):
+        start = time.time()
+        try:
+            response = requests.post(endpoint, json=kwargs, timeout=60)
+            response.raise_for_status()
+            duration = time.time() - start
+            logger.info(f"MCP server response for '{tool_name}' (attempt {attempt}), took {duration:.2f}s")
+            mcp_response = response.json()
+            if mcp_response.get("status") == "success":
+                return str(mcp_response.get("result", f"Tool '{tool_name}' executed successfully via MCP."))
+            error_msg = mcp_response.get("error", "Unknown error from MCP.")
+            logger.error(f"Error from MCP server for tool '{tool_name}': {error_msg}")
+            return f"Error from MCP server for tool '{tool_name}': {error_msg}"
+        except requests.exceptions.RequestException as e:
+            duration = time.time() - start
+            logger.warning(f"Attempt {attempt} failed for MCP tool '{tool_name}' after {duration:.2f}s: {e}")
+            if attempt < max_retries:
+                logger.info(f"Retrying in {backoff}s...")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            logger.error(f"All {max_retries} attempts failed for MCP tool '{tool_name}'.", exc_info=True)
+            return f"Error: Could not connect to or get a valid response from MCP server for tool '{tool_name}'. Details: {e}"
+        except Exception as e:
+            duration = time.time() - start
+            logger.error(f"Unexpected error during MCP tool execution for '{tool_name}' (attempt {attempt}) after {duration:.2f}s: {e}", exc_info=True)
+    return f"Error: An unexpected error occurred while trying to execute tool '{tool_name}' via MCP. Details: {e}"
+
+# Helper to map JSON schema types to Python types
+def python_type_from_jsonschema(prop: dict) -> type:
+    t = prop.get("type")
+    if t == "string":
+        return str
+    if t in ("integer", "number"):
+        return int
+    if t == "boolean":
+        return bool
+    if t == "array":
+        return list
+    if t == "object":
+        return dict
+    return Any
+
+# Dynamically load MCP tool definitions from the server
+def load_mcp_tools() -> List[StructuredTool]:
     try:
-        response = requests.post(endpoint, json=kwargs, timeout=60) # Adjust timeout as needed
-        response.raise_for_status()  # Raise an exception for HTTP errors (4xx or 5xx)
-        
-        mcp_response = response.json()
-        logger.info(f"MCP server response for '{tool_name}': {mcp_response}")
-        
-        # Expecting a response like {"status": "success", "result": "details..."} or {"status": "error", "error": "details..."}
-        if mcp_response.get("status") == "success":
-            return str(mcp_response.get("result", f"Tool '{tool_name}' executed successfully via MCP."))
-        else:
-            return f"Error from MCP server for tool '{tool_name}': {mcp_response.get('error', 'Unknown error from MCP.')}"
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error calling MCP server for tool '{tool_name}': {e}", exc_info=True)
-        return f"Error: Could not connect to or get a valid response from MCP server for tool '{tool_name}'. Details: {str(e)}"
+        resp = requests.get(f"{MCP_SERVER_URL}/tools", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        tools: List[StructuredTool] = []
+        for t in data.get("tools", []):
+            props = t["inputSchema"].get("properties", {})
+            required = t["inputSchema"].get("required", [])
+            fields = {}
+            for name, schema in props.items():
+                py_type = python_type_from_jsonschema(schema)
+                if name in required:
+                    fields[name] = (py_type, Field(..., description=schema.get("description")))
+                else:
+                    default = schema.get("default", None)
+                    fields[name] = (Optional[py_type], Field(default, description=schema.get("description")))
+            model = create_model(f"{t['name'].title().replace('_', '')}Args", **fields)
+            def _make_func(tool_name: str):
+                def func(**kwargs):
+                    return execute_tool_via_mcp(tool_name, **kwargs)
+                return func
+            tool_func = _make_func(t["name"])
+            tools.append(
+                StructuredTool.from_function(
+                    func=tool_func,
+                    name=t["name"],
+                    description=t.get("description", ""),
+                    args_schema=model,
+                )
+            )
+        return tools
     except Exception as e:
-        logger.error(f"Unexpected error during MCP tool execution for '{tool_name}': {e}", exc_info=True)
-        return f"Error: An unexpected error occurred while trying to execute tool '{tool_name}' via MCP. Details: {str(e)}"
+        logger.error(f"Error loading MCP tools: {e}", exc_info=True)
+        return []
 
-# Define the function for StructuredTool more directly.
-def create_ec2_structured_tool_func(
-    image_id: str,
-    min_count: int,
-    max_count: int,
-    instance_type: str = "t2.micro",
-    key_name: Optional[str] = None,
-    security_group_ids: Optional[List[str]] = None,
-    subnet_id: Optional[str] = None,
-    user_data: Optional[str] = None,
-    ebs_optimized: Optional[bool] = False,
-    monitoring_enabled: Optional[bool] = False,
-    availability_zone: Optional[str] = None,
-    tags: Optional[Dict[str, str]] = None,
-    disable_api_termination: Optional[bool] = False,
-    instance_initiated_shutdown_behavior: Optional[str] = "stop",
-    block_device_mappings: Optional[List[Dict[str, Any]]] = None,
-    iam_instance_profile: Optional[Dict[str, str]] = None
-) -> str:
-    """Wrapper function for StructuredTool that matches CreateEc2InstanceArgs fields."""
-    args_dict = {
-        "image_id": image_id, "min_count": min_count, "max_count": max_count,
-        "instance_type": instance_type, "key_name": key_name,
-        "security_group_ids": security_group_ids, "subnet_id": subnet_id,
-        "user_data": user_data, "ebs_optimized": ebs_optimized,
-        "monitoring_enabled": monitoring_enabled, "availability_zone": availability_zone,
-        "tags": tags, "disable_api_termination": disable_api_termination,
-        "instance_initiated_shutdown_behavior": instance_initiated_shutdown_behavior,
-        "block_device_mappings": block_device_mappings,
-        "iam_instance_profile": iam_instance_profile
-    }
-    # Filter out None values so they don't override defaults in execute_tool_via_mcp if not provided
-    cleaned_args = {k: v for k, v in args_dict.items() if v is not None}
-    return execute_tool_via_mcp(tool_name="create_ec2_instance", **cleaned_args)
-
-mcp_create_ec2_lc_tool = StructuredTool.from_function(
-    func=create_ec2_structured_tool_func,
-    name="create_ec2_instance",
-    description="Creates an AWS EC2 instance based on the provided parameters. This tool is used to provision virtual servers in AWS cloud. If the user specifies an \"instance name\", interpret this as a request to set a tag with the key \"Name\" and the value as the specified name.",
-    args_schema=CreateEc2InstanceArgs
-)
-
-ALL_AVAILABLE_TOOLS = [mcp_create_ec2_lc_tool]
+# Load tools once at startup
+MCP_LC_TOOLS: List[StructuredTool] = load_mcp_tools()
 
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
@@ -223,7 +227,7 @@ def llm_node(state: AgentState):
     api_messages = [convert_message_to_dict(msg) for msg in state['messages']]
 
     # Define the list of tools for the OpenAI API call by converting LangChain Tools.
-    raw_openai_tool_definitions = [convert_to_openai_function(t) for t in ALL_AVAILABLE_TOOLS]
+    raw_openai_tool_definitions = [convert_to_openai_function(t) for t in MCP_LC_TOOLS]
     
     # Ensure each tool definition has the 'type: "function"' field
     openai_tool_definitions_for_api = []
@@ -316,7 +320,7 @@ def llm_node(state: AgentState):
     }
 
 # Initialize ToolNode with the LangChain Tool instance(s).
-tool_node = ToolNode(ALL_AVAILABLE_TOOLS)
+tool_node = ToolNode(MCP_LC_TOOLS)
 
 def should_continue(state: AgentState):
     logger.info("Entering should_continue...")

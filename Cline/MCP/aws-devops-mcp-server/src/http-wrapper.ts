@@ -3,7 +3,10 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { createEc2InstanceHandler, CreateEc2InstanceArgs } from './ec2ToolHandler.js';
+import { toolDefinitions } from './toolRegistry.js';
+// Import definitions for type casting
+import { ec2ToolDefinition } from './handlers/ec2ToolHandler.js';
+import { s3ToolDefinition } from './handlers/s3ToolHandler.js';
 
 const mcpServer = new Server(
   {
@@ -18,51 +21,10 @@ const mcpServer = new Server(
   }
 );
 
-// Register tool handler (same as in index.ts)
+
+// Register ListTools dynamically from tool registry
 mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: 'create_ec2_instance',
-      description: 'Creates an AWS EC2 instance based on the provided parameters. This tool is used to provision virtual servers in AWS cloud. If the user specifies an "instance name", interpret this as a request to set a tag with the key "Name" and the value as the specified name.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          image_id: { type: 'string', description: 'The ID of the AMI (Amazon Machine Image) to use for the instance. Required.' },
-          min_count: { type: 'integer', description: 'The minimum number of instances to launch. Usually 1. Required.' },
-          max_count: { type: 'integer', description: 'The maximum number of instances to launch. Usually 1. Required.' },
-          instance_type: { type: 'string', default: 't2.micro', description: 'The type of instance to launch, e.g., "t2.micro", "m5.large".' },
-          key_name: { type: 'string', description: 'The name of the key pair for SSH access.' },
-          security_group_ids: { type: 'array', items: { type: 'string' }, description: 'A list of security group IDs.' },
-          subnet_id: { type: 'string', description: 'The ID of the subnet to launch the instance into.' },
-          user_data: { type: 'string', description: 'User data to make available to the instance.' },
-          ebs_optimized: { type: 'boolean', default: false, description: 'Whether the instance is optimized for Amazon EBS I/O.' },
-          monitoring_enabled: { type: 'boolean', default: false, description: 'Enables detailed monitoring for the instance.' },
-          availability_zone: { type: 'string', description: 'The Availability Zone to launch the instance into, e.g., "us-east-1a".' },
-          tags: { 
-            type: 'object', 
-            additionalProperties: { type: 'string' },
-            description: 'A dictionary of key-value pairs to assign as tags. For instance name, use key "Name". Example: {"Name": "MyServer", "Environment": "Dev"}' 
-          },
-          disable_api_termination: { type: 'boolean', default: false, description: 'If true, enables instance termination protection.' },
-          instance_initiated_shutdown_behavior: { type: 'string', enum: ['stop', 'terminate'], default: 'stop', description: 'Whether the instance should "stop" or "terminate" when shut down from within the OS.' },
-          block_device_mappings: {
-            type: 'array',
-            items: { type: 'object' },
-            description: 'Define EBS volumes. List of mappings, e.g., [{"DeviceName": "/dev/sda1", "Ebs": {"VolumeSize": 30, "VolumeType": "gp3"}}]',
-          },
-          iam_instance_profile: {
-            type: 'object',
-            properties: {
-              Arn: { type: 'string' },
-              Name: { type: 'string' },
-            },
-            description: 'IAM instance profile. Provide as {"Arn": "arn:aws:iam::ACCOUNT:instance-profile/PROFILE_NAME"} or {"Name": "PROFILE_NAME"}.',
-          },
-        },
-        required: ['image_id', 'min_count', 'max_count'],
-      },
-    },
-  ],
+  tools: toolDefinitions.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
 }));
 
 // Express HTTP server
@@ -71,22 +33,59 @@ app.use(bodyParser.json());
 
 app.post('/execute_tool/:tool_name', async (req, res) => {
   const toolName = req.params.tool_name;
+  const currentToolDef = toolDefinitions.find((t) => t.name === toolName);
+  if (!currentToolDef) {
+    res.status(400).json({ status: 'error', error: `Unknown tool: ${toolName}` });
+    return;
+  }
   const args = req.body;
+  let handlerResult; // To store the result from the handler
+
   try {
-    if (toolName === 'create_ec2_instance') {
-      const result = await createEc2InstanceHandler(args as CreateEc2InstanceArgs);
-      if (result.success) {
-        res.json({ status: "success", result: result.message });
+    // Use if/else if on currentToolDef.name and cast to specific type
+    if (currentToolDef.name === 'create_ec2_instance') {
+      const def = currentToolDef as typeof ec2ToolDefinition; // Cast
+      if (def.isValidArgs(args)) { // args is now CreateEc2InstanceArgs
+        handlerResult = await def.handler(args); // def.handler expects CreateEc2InstanceArgs
       } else {
-        res.json({ status: "error", error: result.message });
+        res.status(400).json({ status: 'error', error: `Invalid arguments for ${toolName}` });
+        return;
+      }
+    } else if (currentToolDef.name === 'create_s3_bucket') {
+      const def = currentToolDef as typeof s3ToolDefinition; // Cast
+      if (def.isValidArgs(args)) { // args is now CreateS3BucketArgs
+        handlerResult = await def.handler(args); // def.handler expects CreateS3BucketArgs
+      } else {
+        res.status(400).json({ status: 'error', error: `Invalid arguments for ${toolName}` });
+        return;
       }
     } else {
-      res.status(400).json({ status: "error", error: `Unknown tool: ${toolName}` });
+      // This case should ideally not be reached if toolDefinitions are correctly managed
+      // and toolName is validated against them.
+      console.error(`Unknown tool name '${toolName}' encountered after finding definition.`);
+      res.status(500).json({ status: 'error', error: 'Internal server error: unknown tool definition type after validation' });
+      return;
+    }
+
+    if (handlerResult.success) {
+      res.json({ status: 'success', result: handlerResult.message });
+    } else {
+      res.json({ status: 'error', error: handlerResult.message });
     }
   } catch (err: any) {
-    res.status(500).json({ status: "error", error: err.message || String(err) });
+    console.error(`Error in '${toolName}' handler:`, err);
+    res.status(500).json({ status: 'error', error: err.message || String(err) });
   }
 });
+// Tools discovery endpoint
+app.get('/tools', (_req, res) => {
+  res.json({
+    tools: toolDefinitions.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+  });
+});
+
+// Health check endpoint
+app.get('/healthz', (_req, res) => res.send('OK'));
 
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
