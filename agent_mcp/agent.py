@@ -27,6 +27,43 @@ MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8000") # Define y
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
+# Define a list of critical tools that require confirmation
+CRITICAL_TOOLS = [
+    'create_ec2_instance',
+    'create_s3_bucket',
+    # Add other critical tools here
+]
+
+def is_critical_tool(tool_name: str) -> bool:
+    """Determine if a tool is considered critical and requires confirmation."""
+    return tool_name in CRITICAL_TOOLS
+
+def format_tool_response(tool_name: str, response: str) -> str:
+    """Format tool responses for better presentation to the user."""
+    # Extract the most relevant information based on tool type
+    if tool_name == 'create_ec2_instance' and 'launched successfully' in response.lower():
+        # Try to extract instance IDs
+        import re
+        instance_ids = re.search(r'Instance IDs?: ([\w-]+(?:, [\w-]+)*)', response)
+        if instance_ids:
+            return f"✅ EC2 instance(s) created successfully!\nInstance ID(s): {instance_ids.group(1)}\n\nYou can check the status of your instance(s) in the AWS Console."
+        return f"✅ {response}"
+    
+    if tool_name == 'create_s3_bucket' and 'created successfully' in response.lower():
+        # Extract bucket name
+        import re
+        bucket_name = re.search(r"'([^']+)' created successfully", response)
+        if bucket_name:
+            return f"✅ S3 bucket '{bucket_name.group(1)}' created successfully!\n\nYou can access this bucket in the AWS Console or use AWS CLI/SDK to upload files to it."
+        return f"✅ {response}"
+        
+    # Error handling
+    if 'error' in response.lower():
+        return f"❌ {response}"
+        
+    # Default formatting
+    return response
+
 # Create a LangChain Tool instance for the MCP tool.
 # This function will now call the MCP server.
 def execute_tool_via_mcp(tool_name: str, **kwargs) -> str:
@@ -37,33 +74,86 @@ def execute_tool_via_mcp(tool_name: str, **kwargs) -> str:
     logger.info(f"Calling MCP server endpoint: {endpoint} with args: {kwargs}")
     max_retries = 3
     backoff = 1
+    
     for attempt in range(1, max_retries + 1):
         start = time.time()
         try:
+            # Add request validation
+            if not MCP_SERVER_URL:
+                return "Error: MCP server URL is not configured. Please set the MCP_SERVER_URL environment variable."
+                
+            # Add timeout handling with a specific message
             response = requests.post(endpoint, json=kwargs, timeout=60)
+            
+            # More detailed HTTP error handling
+            if response.status_code >= 400:
+                error_info = f"HTTP {response.status_code}"
+                try:
+                    error_body = response.json()
+                    if isinstance(error_body, dict):
+                        error_info += f": {error_body.get('error', 'Unknown error')}"
+                except:
+                    error_info += f": {response.text[:100]}..."
+                
+                if 400 <= response.status_code < 500:
+                    return f"Client error when calling MCP tool '{tool_name}': {error_info}"
+                else:
+                    # Only retry server errors
+                    if attempt < max_retries:
+                        logger.warning(f"Server error (attempt {attempt}): {error_info}. Retrying in {backoff}s...")
+                        time.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    return f"Server error when calling MCP tool '{tool_name}' after {max_retries} attempts: {error_info}"
+            
+            # Regular response processing
             response.raise_for_status()
             duration = time.time() - start
             logger.info(f"MCP server response for '{tool_name}' (attempt {attempt}), took {duration:.2f}s")
+            
             mcp_response = response.json()
             if mcp_response.get("status") == "success":
-                return str(mcp_response.get("result", f"Tool '{tool_name}' executed successfully via MCP."))
+                result_text = str(mcp_response.get("result", f"Tool '{tool_name}' executed successfully via MCP."))
+                return format_tool_response(tool_name, result_text)
+                
             error_msg = mcp_response.get("error", "Unknown error from MCP.")
             logger.error(f"Error from MCP server for tool '{tool_name}': {error_msg}")
-            return f"Error from MCP server for tool '{tool_name}': {error_msg}"
-        except requests.exceptions.RequestException as e:
+            return f"❌ Error from MCP server for tool '{tool_name}': {error_msg}"
+            
+        except requests.exceptions.Timeout:
             duration = time.time() - start
-            logger.warning(f"Attempt {attempt} failed for MCP tool '{tool_name}' after {duration:.2f}s: {e}")
+            logger.warning(f"Timeout (attempt {attempt}) for MCP tool '{tool_name}' after {duration:.2f}s")
             if attempt < max_retries:
                 logger.info(f"Retrying in {backoff}s...")
                 time.sleep(backoff)
                 backoff *= 2
                 continue
-            logger.error(f"All {max_retries} attempts failed for MCP tool '{tool_name}'.", exc_info=True)
-            return f"Error: Could not connect to or get a valid response from MCP server for tool '{tool_name}'. Details: {e}"
+            return f"❌ Error: MCP server timeout after {max_retries} attempts for tool '{tool_name}'. The operation might be taking longer than expected or the server might be overloaded."
+            
+        except requests.exceptions.ConnectionError:
+            duration = time.time() - start
+            logger.warning(f"Connection error (attempt {attempt}) for MCP tool '{tool_name}' after {duration:.2f}s")
+            if attempt < max_retries:
+                logger.info(f"Retrying in {backoff}s...")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            return f"❌ Error: Could not connect to MCP server after {max_retries} attempts for tool '{tool_name}'. Please check that the server is running and accessible."
+            
+        except json.JSONDecodeError:
+            duration = time.time() - start
+            logger.error(f"Invalid JSON response from MCP server for tool '{tool_name}' after {duration:.2f}s")
+            return f"❌ Error: MCP server returned an invalid response format for tool '{tool_name}'. Expected JSON but received: {response.text[:100]}..."
+            
         except Exception as e:
             duration = time.time() - start
             logger.error(f"Unexpected error during MCP tool execution for '{tool_name}' (attempt {attempt}) after {duration:.2f}s: {e}", exc_info=True)
-    return f"Error: An unexpected error occurred while trying to execute tool '{tool_name}' via MCP. Details: {e}"
+            if attempt < max_retries:
+                logger.info(f"Retrying in {backoff}s...")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            return f"❌ Error: An unexpected error occurred while trying to execute tool '{tool_name}' via MCP: {str(e)}"
 
 # Helper to map JSON schema types to Python types
 def python_type_from_jsonschema(prop: dict) -> type:
@@ -80,9 +170,44 @@ def python_type_from_jsonschema(prop: dict) -> type:
         return dict
     return Any
 
+# Check MCP server health
+def check_mcp_server_health() -> bool:
+    """
+    Check if the MCP server is healthy and operational.
+    Returns True if healthy, False otherwise.
+    """
+    try:
+        health_endpoint = f"{MCP_SERVER_URL}/health"
+        logger.info(f"Checking MCP server health at: {health_endpoint}")
+        
+        response = requests.get(health_endpoint, timeout=5)
+        if response.status_code == 200:
+            logger.info("MCP server health check passed")
+            return True
+        
+        logger.warning(f"MCP server health check failed with status code: {response.status_code}")
+        try:
+            error_body = response.json()
+            logger.warning(f"Health check error response: {error_body}")
+        except:
+            logger.warning(f"Health check raw response: {response.text[:100]}")
+        
+        return False
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"MCP server health check failed: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error during MCP server health check: {e}", exc_info=True)
+        return False
+
 # Dynamically load MCP tool definitions from the server
 def load_mcp_tools() -> List[StructuredTool]:
     try:
+        # First perform a health check
+        is_healthy = check_mcp_server_health()
+        if not is_healthy:
+            logger.warning("MCP server health check failed, but will attempt to load tools anyway")
+        
         resp = requests.get(f"{MCP_SERVER_URL}/tools", timeout=10)
         resp.raise_for_status()
         data = resp.json()
@@ -117,8 +242,158 @@ def load_mcp_tools() -> List[StructuredTool]:
         logger.error(f"Error loading MCP tools: {e}", exc_info=True)
         return []
 
-# Load tools once at startup
-MCP_LC_TOOLS: List[StructuredTool] = load_mcp_tools()
+# MCP server monitoring service
+def start_mcp_server_monitor(check_interval_seconds: int = 60):
+    """
+    Start a background thread that periodically checks the health of the MCP server.
+    
+    Args:
+        check_interval_seconds: How often to check the server health (in seconds)
+    """
+    import threading
+    
+    def monitor_loop():
+        logger.info(f"Starting MCP server monitoring service (interval: {check_interval_seconds}s)")
+        consecutive_failures = 0
+        max_failures_to_report = 3  # Only log errors for this many consecutive failures
+        
+        while True:
+            try:
+                is_healthy = check_mcp_server_health()
+                
+                if is_healthy:
+                    if consecutive_failures > 0:
+                        logger.info(f"MCP server is healthy again after {consecutive_failures} failed checks")
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures <= max_failures_to_report:
+                        logger.warning(f"MCP server health check failed (attempt {consecutive_failures})")
+                    elif consecutive_failures % 10 == 0:  # Log every 10th failure after max_failures_to_report
+                        logger.warning(f"MCP server health check still failing after {consecutive_failures} attempts")
+                
+                # Add server statistics logging here if needed
+                # For example, count of calls to each tool, response times, etc.
+                
+            except Exception as e:
+                logger.error(f"Error in MCP server monitoring thread: {e}", exc_info=True)
+            
+            # Sleep for the specified interval
+            time.sleep(check_interval_seconds)
+    
+    # Start the monitoring in a daemon thread (will exit when main program exits)
+    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    monitor_thread.start()
+    logger.info("MCP server monitoring thread started")
+
+# Global variables to track tool state
+MCP_LC_TOOLS: List[StructuredTool] = []
+last_tools_update_time = 0
+tools_load_lock = threading.Lock()  # To prevent concurrent tool reloading
+
+def reload_mcp_tools_if_needed(force: bool = False) -> List[StructuredTool]:
+    """
+    Reload MCP tools if they haven't been loaded yet or if forced.
+    Returns the current list of tools.
+    
+    Args:
+        force: If True, reload tools regardless of when they were last loaded
+    """
+    global MCP_LC_TOOLS, last_tools_update_time
+    
+    # Use a lock to prevent multiple threads from loading tools simultaneously
+    with tools_load_lock:
+        current_time = time.time()
+        time_since_last_update = current_time - last_tools_update_time
+        
+        # Reload if:
+        # 1. Tools have never been loaded (last_tools_update_time == 0)
+        # 2. Forced reload is requested
+        # 3. Tools are empty (perhaps initial load failed)
+        if force or last_tools_update_time == 0 or len(MCP_LC_TOOLS) == 0:
+            logger.info(f"Loading MCP tools (forced={force}, time_since_last_update={time_since_last_update:.1f}s)")
+            new_tools = load_mcp_tools()
+            
+            if new_tools:
+                # Update the global tool list only if we got valid tools
+                MCP_LC_TOOLS = new_tools
+                last_tools_update_time = current_time
+                
+                # Log the loaded tools
+                tool_names = [t.name for t in MCP_LC_TOOLS]
+                logger.info(f"Loaded {len(MCP_LC_TOOLS)} MCP tools: {', '.join(tool_names)}")
+            else:
+                logger.warning("Failed to load MCP tools or no tools were returned")
+        
+    return MCP_LC_TOOLS
+
+# Update MCP server monitoring to include tool reloading
+def start_mcp_server_monitor(check_interval_seconds: int = 60, tool_reload_interval_hours: int = 12):
+    """
+    Start a background thread that periodically checks the health of the MCP server
+    and reloads tools at a specified interval.
+    
+    Args:
+        check_interval_seconds: How often to check the server health (in seconds)
+        tool_reload_interval_hours: How often to reload tools regardless of server health (in hours)
+    """
+    import threading
+    
+    tool_reload_interval_seconds = tool_reload_interval_hours * 3600
+    
+    def monitor_loop():
+        logger.info(f"Starting MCP server monitoring service (health check interval: {check_interval_seconds}s, tool reload interval: {tool_reload_interval_hours}h)")
+        consecutive_failures = 0
+        max_failures_to_report = 3  # Only log errors for this many consecutive failures
+        last_tool_reload_time = time.time()
+        
+        # Perform initial tool load
+        reload_mcp_tools_if_needed(force=True)
+        
+        while True:
+            try:
+                # Check server health
+                is_healthy = check_mcp_server_health()
+                
+                current_time = time.time()
+                time_since_last_reload = current_time - last_tool_reload_time
+                
+                if is_healthy:
+                    if consecutive_failures > 0:
+                        logger.info(f"MCP server is healthy again after {consecutive_failures} failed checks")
+                        # Reload tools when server becomes healthy after failures
+                        reload_mcp_tools_if_needed(force=True)
+                        last_tool_reload_time = current_time
+                    consecutive_failures = 0
+                    
+                    # Reload tools periodically even if server is healthy
+                    if time_since_last_reload >= tool_reload_interval_seconds:
+                        logger.info(f"Performing periodic tool reload after {time_since_last_reload/3600:.1f} hours")
+                        reload_mcp_tools_if_needed(force=True)
+                        last_tool_reload_time = current_time
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures <= max_failures_to_report:
+                        logger.warning(f"MCP server health check failed (attempt {consecutive_failures})")
+                    elif consecutive_failures % 10 == 0:  # Log every 10th failure after max_failures_to_report
+                        logger.warning(f"MCP server health check still failing after {consecutive_failures} attempts")
+                
+            except Exception as e:
+                logger.error(f"Error in MCP server monitoring thread: {e}", exc_info=True)
+            
+            # Sleep for the specified interval
+            time.sleep(check_interval_seconds)
+    
+    # Start the monitoring in a daemon thread (will exit when main program exits)
+    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    monitor_thread.start()
+    logger.info("MCP server monitoring thread started")
+
+# Start MCP server monitoring
+start_mcp_server_monitor()
+
+# Initial load of tools
+reload_mcp_tools_if_needed()
 
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
@@ -241,9 +516,10 @@ def llm_node(state: AgentState):
 
     last_message_in_state = state['messages'][-1] if state['messages'] else None
     if isinstance(last_message_in_state, ToolMessage) and \
-       last_message_in_state.name == 'create_ec2_instance' and \
-       "launched successfully" in str(last_message_in_state.content).lower():
-        logger.info(f"Last action was a successful 'create_ec2_instance' (MCP tool). Forcing LLM to generate text response without tools.")
+       is_critical_tool(last_message_in_state.name) and \
+       any(success_indicator in str(last_message_in_state.content).lower() 
+           for success_indicator in ["launched successfully", "created successfully"]):
+        logger.info(f"Last action was a successful '{last_message_in_state.name}' (critical MCP tool). Forcing LLM to generate text response without tools.")
         openai_tool_definitions_for_api = [] # No tools for this call
         updated_pending_action_details = None
         updated_is_awaiting_confirmation = False
@@ -274,7 +550,7 @@ def llm_node(state: AgentState):
         pending_action_to_confirm = None
         if raw_tool_calls:
             for tc_data in raw_tool_calls:
-                if tc_data["name"] == 'create_ec2_instance':
+                if is_critical_tool(tc_data["name"]):
                     critical_tool_called = True
                     pending_action_to_confirm = {
                         "tool_name": tc_data["name"],
@@ -319,8 +595,15 @@ def llm_node(state: AgentState):
         "is_awaiting_confirmation": updated_is_awaiting_confirmation
     }
 
-# Initialize ToolNode with the LangChain Tool instance(s).
-tool_node = ToolNode(MCP_LC_TOOLS)
+# Initialize ToolNode with current tools and allow refreshing
+def get_tool_node():
+    """Get a ToolNode with the latest MCP tools."""
+    # Ensure we have the latest tools (but don't force reload)
+    current_tools = reload_mcp_tools_if_needed()
+    return ToolNode(current_tools)
+
+# Initial tool node
+tool_node = get_tool_node()
 
 def should_continue(state: AgentState):
     logger.info("Entering should_continue...")
@@ -336,10 +619,22 @@ def should_continue(state: AgentState):
     return END
 
 def build_agent():
+    """
+    Build the agent graph with the latest tools.
+    This ensures that any new or modified MCP tools are included when the agent is built.
+    """
     logger.info("Building agent graph...")
+    
+    # Force a tool reload before building the agent to ensure we have the latest tools
+    reload_mcp_tools_if_needed(force=True)
+    
+    # Get a fresh tool node with the latest tools
+    current_tool_node = get_tool_node()
+    
+    # Create the graph with the latest tools
     graph = StateGraph(AgentState)
     graph.add_node("llm", llm_node)
-    graph.add_node("tools", tool_node)
+    graph.add_node("tools", current_tool_node)
     graph.set_entry_point("llm")
     graph.add_conditional_edges(
         "llm",
@@ -347,6 +642,8 @@ def build_agent():
         {"tools": "tools", END: END}
     )
     graph.add_edge("tools", "llm")
+    
+    logger.info("Agent graph built successfully with latest MCP tools")
     return graph.compile()
 
 _agent_runnable = build_agent()
