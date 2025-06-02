@@ -140,3 +140,5 @@ cd ..
 -   The `aws-devops-mcp-server` will likely require AWS credentials to be configured in its environment (e.g., via `~/.aws/credentials`, environment variables like `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, or an IAM role if running on EC2).
 
 With these steps, you should be able to run the AI agent and its associated MCP server. You can then start interacting with the agent to perform tasks.
+
+Test..
